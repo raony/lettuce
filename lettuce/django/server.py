@@ -196,6 +196,8 @@ class ThreadedServer(multiprocessing.Process):
             except ValueError:
                 pass
 
+from django.db import connections
+from django.test.testcases import LiveServerThread
 
 class Server(object):
     """A silenced, lightweight and simple django's builtin server so
@@ -205,37 +207,36 @@ class Server(object):
     def __init__(self, address='0.0.0.0', port=None):
         self.port = int(port or getattr(settings, 'LETTUCE_SERVER_PORT', 8000))
         self.address = unicode(address)
-        self._actual_server = ThreadedServer(self.address, self.port)
+        connections_override = {}
+        for conn in connections.all():
+            if (conn.settings_dict['ENGINE'] == 'django.db.backends.sqlite3' and conn.settings_dict['NAME'] == ':memory:'):
+                conn.allow_thread_sharing = True
+                connections_override[conn.alias] = conn
+        self._actual_server = LiveServerThread(self.address, [self.port], connections_override)
 
     def start(self):
         """Starts the webserver thread, and waits it to be available"""
         call_hook('before', 'runserver', self._actual_server)
-        if self._actual_server.should_serve_admin_media():
-            msg = "Preparing to serve django's admin site static files"
-            if getattr(settings, 'LETTUCE_SERVE_ADMIN_MEDIA', False):
-                msg += ' (as per settings.LETTUCE_SERVE_ADMIN_MEDIA=True)'
-
-            print "%s..." % msg
-
+        self._actual_server.daemon = True
         self._actual_server.start()
-        self._actual_server.wait()
-
-        addrport = self.address, self._actual_server.port
-        if not self._actual_server.is_alive():
-            raise LettuceServerException(
-                'Lettuce could not run the builtin Django server at %s:%d"\n'
-                'maybe you forgot a "runserver" instance running ?\n\n'
-                'well if you really do not want lettuce to run the server '
-                'for you, then just run:\n\n'
-                'python manage.py --no-server' % addrport,
-            )
+        self._actual_server.is_ready.wait()
+        if self._actual_server.error:
+            raise self._actual_server.error
+        addrport = self.address, self.port
+#        if not self._actual_server.is_alive():
+#            raise LettuceServerException(
+#                'Lettuce could not run the builtin Django server at %s:%d"\n'
+#                'maybe you forgot a "runserver" instance running ?\n\n'
+#                'well if you really do not want lettuce to run the server '
+#                'for you, then just run:\n\n'
+#                'python manage.py --no-server' % addrport,
+#            )
 
         print "Django's builtin server is running at %s:%d" % addrport
 
     def stop(self, fail=False):
-        pid = self._actual_server.pid
-        if pid:
-            os.kill(pid, 9)
+        if self._actual_server:
+            self._actual_server.join()
 
         code = int(fail)
         call_hook('after', 'runserver', self._actual_server)
